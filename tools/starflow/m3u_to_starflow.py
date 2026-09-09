@@ -355,18 +355,25 @@ def convert_text(
 
     probe_results: Dict[str, Tuple[str, str]] = {}
     if probe_fn is not None and candidates:
-        urls = [sanitized.url for _, _, sanitized in candidates]
+        urls = [
+            sanitized.url
+            for _, _, sanitized in candidates
+            if urlsplit(sanitized.url).scheme.lower() in ("http", "https")
+        ]
         worker_count = max(1, min(probe_workers, len(urls)))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-            values = executor.map(probe_fn, urls)
-            for url, value in zip(urls, values):
-                probe_results[url] = _probe_state(value)
+        if urls:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                values = executor.map(probe_fn, urls)
+                for url, value in zip(urls, values):
+                    probe_results[url] = _probe_state(value)
 
     channel_data: Dict[str, Dict[str, object]] = {}
     line_statuses: Dict[str, List[str]] = {}
     for entry, channel_id, sanitized in candidates:
         if probe_fn is None:
             status, reason = "skipped", "not_probed"
+        elif urlsplit(sanitized.url).scheme.lower() not in ("http", "https"):
+            status, reason = "skipped", "non_http_not_probed"
         else:
             status, reason = probe_results.get(sanitized.url, ("failed", "probe_missing"))
         if status == "failed":
