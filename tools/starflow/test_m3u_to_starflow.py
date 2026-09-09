@@ -1,12 +1,20 @@
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+
 
 MODULE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(MODULE_DIR))
 
-from m3u_to_starflow import convert_text, redact_url, sanitize_url  # noqa: E402
+from m3u_to_starflow import (  # noqa: E402
+    build_manifest,
+    convert_text,
+    redact_url,
+    sanitize_url,
+    write_bundle,
+)
 
 
 M3U = """#EXTM3U x-tvg-url="https://epg.example/e.xml"
@@ -60,23 +68,13 @@ class M3UToStarflowTest(unittest.TestCase):
             "http://stream.example/cctv1.m3u8?key=txiptv&playlive=0&authid=0",
             cctv1["sources"][0]["url"],
         )
-        all_urls = [
-            source["url"]
-            for channel in result.channels
-            for source in channel["sources"]
-        ]
-        self.assertTrue(
-            all("token=" not in url and "signature=" not in url for url in all_urls)
-        )
+        all_urls = [source["url"] for channel in result.channels for source in channel["sources"]]
+        self.assertTrue(all("token=" not in url and "signature=" not in url for url in all_urls))
         self.assertEqual(result.live_m3u, result.live_txt)
         self.assertNotIn("secret", result.live_m3u)
         self.assertNotIn("temporary", result.live_m3u)
         self.assertEqual(
-            {
-                "lives": [
-                    {"name": "StarFlowTV", "playerType": 1, "type": 0, "url": "live.txt"}
-                ]
-            },
+            {"lives": [{"name": "StarFlowTV", "playerType": 1, "type": 0, "url": "live.txt"}]},
             json.loads(result.tvbox_live_json),
         )
 
@@ -101,6 +99,41 @@ class M3UToStarflowTest(unittest.TestCase):
         self.assertNotIn("secret", report_text)
         self.assertNotIn("temporary", report_text)
         self.assertNotIn("token=", report_text)
+
+    def test_bundle_and_manifest_have_consistent_hashes_and_urls(self):
+        with self.subTest("bundle"):
+            result = convert_text(
+                M3U,
+                config_version=123,
+                generated_at="2026-09-09T00:00:00Z",
+                probe_fn=lambda url: True,
+            )
+            with tempfile.TemporaryDirectory() as directory:
+                output = Path(directory)
+                write_bundle(result, output)
+                manifest = build_manifest(
+                    output,
+                    "https://config.example/starflow/config",
+                    123,
+                    "2026-09-09T00:00:00Z",
+                    "test-key",
+                )
+                self.assertEqual(
+                    {"live.json", "live.m3u", "live.txt", "tvbox-live.json", "checksums.sha256"},
+                    {entry["name"] for entry in manifest["files"]},
+                )
+                self.assertTrue(
+                    all(
+                        entry["url"].startswith(
+                            "https://config.example/starflow/config/releases/123/"
+                        )
+                        for entry in manifest["files"]
+                    )
+                )
+                live_json = next(
+                    entry for entry in manifest["files"] if entry["name"] == "live.json"
+                )
+                self.assertEqual(live_json["size"], (output / "live.json").stat().st_size)
 
 
 if __name__ == "__main__":
