@@ -246,12 +246,22 @@ jobs:
           chmod 600 "$RUNNER_TEMP/starflow-ssh/id_ed25519"
 
           remote_target="$DEPLOY_USER@$DEPLOY_HOST"
-          remote_command="$(printf 'bash -s -- %q %q %q' "$DEPLOY_PATH" "$CONFIG_VERSION" "$GITHUB_RUN_ID")"
-          tar -C build/starflow-live -czf - . | ssh -p "$DEPLOY_PORT" \
-            -o BatchMode=yes \
-            -o StrictHostKeyChecking=accept-new \
-            -i "$RUNNER_TEMP/starflow-ssh/id_ed25519" \
-            "$remote_target" "$remote_command" <<'REMOTE'
+          ssh_remote() {
+            ssh -p "$DEPLOY_PORT" \
+              -o BatchMode=yes \
+              -o StrictHostKeyChecking=accept-new \
+              -i "$RUNNER_TEMP/starflow-ssh/id_ed25519" \
+              "$@"
+          }
+          stage_path="$DEPLOY_PATH/releases/.staging-$CONFIG_VERSION-$GITHUB_RUN_ID"
+          quoted_stage_path="$(printf '%q' "$stage_path")"
+          cleanup_remote_stage() {
+            ssh_remote "$remote_target" "rm -rf -- $quoted_stage_path" >/dev/null 2>&1 || true
+          }
+          trap cleanup_remote_stage EXIT
+
+          prepare_command="$(printf 'bash -s -- %q %q %q' "$DEPLOY_PATH" "$CONFIG_VERSION" "$GITHUB_RUN_ID")"
+          ssh_remote "$remote_target" "$prepare_command" <<'REMOTE_PREPARE'
           set -euo pipefail
           root="$1"
           version="$2"
@@ -273,33 +283,57 @@ jobs:
             exit 1
           fi
           mkdir "$stage"
+          REMOTE_PREPARE
+
+          tar -C build/starflow-live -czf - . | ssh_remote "$remote_target" \
+            "tar -xzf - -C $quoted_stage_path"
+
+          publish_command="$(printf 'bash -s -- %q %q %q' "$DEPLOY_PATH" "$CONFIG_VERSION" "$GITHUB_RUN_ID")"
+          ssh_remote "$remote_target" "$publish_command" <<'REMOTE_PUBLISH'
+          set -euo pipefail
+          root="$1"
+          version="$2"
+          run_id="$3"
+          release_root="$root/releases"
+          stage="$release_root/.staging-$version-$run_id"
+          final="$release_root/$version"
+
           cleanup_stage() {
             rm -rf -- "$stage"
           }
           trap cleanup_stage EXIT
-          tar -xzf - -C "$stage"
           test -s "$stage/manifest.json"
           test -s "$stage/manifest.sig"
           test -s "$stage/manifest.sha256"
           test -s "$stage/live.json"
           test -s "$stage/live.txt"
           (cd "$stage" && sha256sum -c manifest.sha256 && sha256sum -c checksums.sha256)
+          if [ -e "$final" ]; then
+            echo "远端版本目录已存在"
+            exit 1
+          fi
           mv -- "$stage" "$final"
           trap - EXIT
 
           install -d -m 0755 "$root"
-          for name in manifest.sig manifest.sha256 live.json live.txt live.m3u tvbox-live.json epg.xml; do
+          for name in live.json live.txt live.m3u tvbox-live.json epg.xml; do
             if [ -f "$final/$name" ]; then
               temp="$root/.$name.$version.$run_id.tmp"
               install -m 0644 "$final/$name" "$temp"
               mv -f -- "$temp" "$root/$name"
             fi
           done
+          for name in manifest.sig manifest.sha256; do
+            temp="$root/.$name.$version.$run_id.tmp"
+            install -m 0644 "$final/$name" "$temp"
+            mv -f -- "$temp" "$root/$name"
+          done
           temp="$root/.manifest.json.$version.$run_id.tmp"
           install -m 0644 "$final/manifest.json" "$temp"
           mv -f -- "$temp" "$root/manifest.json"
           echo "1Panel release published"
-          REMOTE
+          REMOTE_PUBLISH
+
 
       - name: Write pipeline summary
         if: always()
