@@ -1,134 +1,315 @@
-name: Sync with Upstream Repository
+name: StarFlowTV source sync and publish
 
 on:
-  # 允许手动触发
   workflow_dispatch:
     inputs:
       upstream_repo:
-        description: '上游仓库地址'
+        description: "上游仓库（owner/name）"
         required: true
-        default: 'vbskycn/iptv'
+        default: "vbskycn/iptv"
+        type: string
       upstream_branch:
-        description: '上游分支名称'
+        description: "上游分支"
         required: true
-        default: 'master'
-  
-  # 每6小时自动运行一次
+        default: "master"
+        type: string
+      force_rebuild:
+        description: "即使上游无变化也重新生成并检测"
+        required: true
+        default: false
+        type: boolean
+      deploy:
+        description: "通过检测后发布到 1Panel"
+        required: true
+        default: true
+        type: boolean
   schedule:
-    - cron: '0 */6 * * *'
-
-  # 当仓库有push时也运行
+    - cron: "0 */6 * * *"
   push:
-    branches: [ master ]
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+concurrency:
+  group: starflow-source-pipeline
+  cancel-in-progress: false
 
 jobs:
-  sync:
+  sync-build-publish:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 45
+    env:
+      CONFIG_BASE_URL: ${{ vars.STARFLOW_CONFIG_BASE_URL || 'https://config.yuying.beauty/starflow/config' }}
+      CONFIG_KEY_ID: ${{ vars.STARFLOW_CONFIG_KEY_ID || 'starflow-production-2026-01' }}
+      CONFIG_PUBLIC_KEY_B64: "UoMhgZDSBxilLMXr0qGSTGH2NhNEzxP05gIpuzTv9xs="
+
     steps:
-    - name: Checkout current repository
-      uses: actions/checkout@v4
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-        fetch-depth: 0
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Configure Git
-      run: |
-        git config --global user.name "GitHub Actions"
-        git config --global user.email "actions@github.com"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-    - name: Add upstream remote
-      run: |
-        git remote add upstream https://github.com/${{ github.event.inputs.upstream_repo || 'vbskycn/iptv' }}.git
-        git fetch upstream
+      - name: Install source pipeline dependency
+        run: python -m pip install --disable-pip-version-check --quiet cryptography
 
-    - name: Check if there are changes to sync
-      id: check_changes
-      run: |
-        UPSTREAM_BRANCH="${{ github.event.inputs.upstream_branch || 'master' }}"
-        CURRENT_BRANCH="master"
-        
-        # 检查是否有新的提交
-        if git diff --quiet HEAD upstream/$UPSTREAM_BRANCH; then
-          echo "no_changes=true" >> $GITHUB_OUTPUT
-          echo "No changes to sync"
-        else
-          echo "no_changes=false" >> $GITHUB_OUTPUT
-          echo "Changes detected, will sync"
-        fi
+      - name: Sync upstream without overwriting protected files
+        id: sync
+        env:
+          UPSTREAM_REPO: ${{ github.event.inputs.upstream_repo || 'vbskycn/iptv' }}
+          UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || 'master' }}
+          FORCE_REBUILD: ${{ github.event.inputs.force_rebuild || 'false' }}
+          TARGET_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          case "$UPSTREAM_REPO" in
+            [A-Za-z0-9._-]*/[A-Za-z0-9._-]*) ;;
+            *) echo "上游仓库格式无效"; exit 1 ;;
+          esac
+          case "$UPSTREAM_BRANCH" in
+            ""|*[!A-Za-z0-9._/-]*) echo "上游分支格式无效"; exit 1 ;;
+          esac
+          case "$TARGET_BRANCH" in
+            ""|*[!A-Za-z0-9._/-]*) echo "目标分支格式无效"; exit 1 ;;
+          esac
 
-    - name: Check for local modifications
-      id: check_local_modifications
-      run: |
-        # 检查是否有本地修改
-        if git diff --quiet HEAD origin/master; then
-          echo "has_local_modifications=false" >> $GITHUB_OUTPUT
-          echo "No local modifications detected"
-        else
-          echo "has_local_modifications=true" >> $GITHUB_OUTPUT
-          echo "Local modifications detected, will force sync with upstream"
-        fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+          git fetch upstream "$UPSTREAM_BRANCH"
 
-    - name: Sync with upstream
-      if: steps.check_changes.outputs.no_changes == 'false'
-      run: |
-        UPSTREAM_BRANCH="${{ github.event.inputs.upstream_branch || 'master' }}"
-        CURRENT_BRANCH="master"
-        
-        # 切换到目标分支
-        git checkout $CURRENT_BRANCH
-        
-        # 备份当前的工作流文件
-        if [ -d ".github/workflows" ]; then
-          cp -r .github/workflows .github/workflows.backup
-        fi
-        
-        # 强制同步：以远程仓库为准
-        # 如果有本地修改或冲突，将被上游更改覆盖
-        git fetch upstream $UPSTREAM_BRANCH
-        
-        # 尝试合并，如果有冲突则强制使用上游版本
-        if ! git merge upstream/$UPSTREAM_BRANCH --no-edit; then
-          echo "检测到合并冲突，强制使用上游版本"
-          # 如果有冲突，强制使用上游版本
-          git checkout --theirs .
-          git add .
-          git commit -m "强制同步：解决合并冲突，使用上游版本"
-        fi
-        
-        # 恢复工作流文件，避免权限问题
-        # 这确保fork用户的工作流文件不会被上游覆盖
-        if [ -d ".github/workflows.backup" ]; then
-          rm -rf .github/workflows
-          mv .github/workflows.backup .github/workflows
-          git add .github/workflows/
-        fi
-        
-        # 强制推送更改（覆盖任何本地修改）
-        git push origin $CURRENT_BRANCH --force
+          if git diff --quiet HEAD "upstream/$UPSTREAM_BRANCH"; then
+            if [ "$FORCE_REBUILD" != "true" ]; then
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "上游无变化，跳过生成和发布"
+              exit 0
+            fi
+            echo "强制重新生成"
+          else
+            echo "检测到上游变化，开始合并"
+            if ! git merge --no-ff --no-commit "upstream/$UPSTREAM_BRANCH"; then
+              git merge --abort || true
+              echo "上游合并冲突，已停止；没有自动覆盖冲突文件"
+              exit 1
+            fi
 
-    - name: Create sync summary
-      if: steps.check_changes.outputs.no_changes == 'false'
-      run: |
-        echo "## 🔄 同步完成" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "✅ 已成功同步上游仓库的更改" >> $GITHUB_STEP_SUMMARY
-        echo "⚠️ 注意：工作流文件(.github/workflows/)已排除同步，避免权限问题" >> $GITHUB_STEP_SUMMARY
-        if [ "${{ steps.check_local_modifications.outputs.has_local_modifications }}" == "true" ]; then
-          echo "🔄 检测到本地修改，已强制以远程仓库为准进行同步" >> $GITHUB_STEP_SUMMARY
-        fi
-        echo "🔧 冲突处理：如有合并冲突，自动使用上游版本覆盖本地修改" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "**同步时间:** $(date)" >> $GITHUB_STEP_SUMMARY
-        echo "**上游仓库:** ${{ github.event.inputs.upstream_repo || 'vbskycn/iptv' }}" >> $GITHUB_STEP_SUMMARY
-        echo "**上游分支:** ${{ github.event.inputs.upstream_branch || 'master' }}" >> $GITHUB_STEP_SUMMARY
-        echo "**同步模式:** 强制同步（以远程仓库为准，自动解决冲突）" >> $GITHUB_STEP_SUMMARY
+            for protected in .github/workflows tools/starflow; do
+              if git ls-tree -d HEAD -- "$protected" | grep -q .; then
+                git restore --source=HEAD --staged --worktree -- "$protected"
+              fi
+              git clean -fd -- "$protected"
+            done
 
-    - name: No changes notification
-      if: steps.check_changes.outputs.no_changes == 'true'
-      run: |
-        echo "## ℹ️ 无需同步" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "✅ 当前仓库已是最新状态，无需同步" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "**检查时间:** $(date)" >> $GITHUB_STEP_SUMMARY
+            git add -A
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: sync upstream source data"
+            fi
+            git push origin "$TARGET_BRANCH"
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "同步完成，后续步骤将在同一次运行内执行"
+
+      - name: Resolve monotonic config version
+        id: version
+        if: ${{ steps.sync.outputs.changed == 'true' }}
+        run: |
+          set -euo pipefail
+          base_version="$(date -u +%s)"
+          current_version=0
+          if curl --fail --retry 2 --silent --show-error \
+              --output "$RUNNER_TEMP/current-manifest.json" \
+              "$CONFIG_BASE_URL/manifest.json"; then
+            current_version="$(python -c 'import json,sys; print(int(json.load(open(sys.argv[1], encoding="utf-8")).get("configVersion", 0)))' "$RUNNER_TEMP/current-manifest.json" 2>/dev/null || true)"
+          fi
+          if [ -z "$current_version" ]; then
+            current_version=0
+          fi
+          if [ "$base_version" -le "$current_version" ]; then
+            config_version=$((current_version + 1))
+          else
+            config_version="$base_version"
+          fi
+          case "$config_version" in
+            ''|*[!0-9]*) echo "配置版本无效"; exit 1 ;;
+          esac
+          echo "config_version=$config_version" >> "$GITHUB_OUTPUT"
+          echo "config version resolved"
+
+      - name: Run converter tests
+        if: ${{ steps.sync.outputs.changed == 'true' }}
+        working-directory: tools/starflow
+        run: python -m unittest discover -p "test_*.py" -v
+
+      - name: Generate sanitized and probed StarFlowTV bundle
+        id: generate
+        if: ${{ steps.sync.outputs.changed == 'true' }}
+        env:
+          CONFIG_VERSION: ${{ steps.version.outputs.config_version }}
+        run: |
+          set -euo pipefail
+          test -s tv/iptv4.m3u
+          mkdir -p build/starflow-live
+          python tools/starflow/m3u_to_starflow.py \
+            --input tv/iptv4.m3u \
+            --output-dir build/starflow-live \
+            --config-version "$CONFIG_VERSION" \
+            --base-url "$CONFIG_BASE_URL" \
+            --key-id "$CONFIG_KEY_ID" \
+            --probe-http \
+            --timeout 5 \
+            --retries 2 \
+            --probe-workers 12 \
+            --report build/source-report.json
+
+      - name: Require and apply production config signature
+        if: ${{ steps.generate.outcome == 'success' }}
+        env:
+          STARFLOW_CONFIG_SIGNING_KEY_B64: ${{ secrets.STARFLOW_CONFIG_SIGNING_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$STARFLOW_CONFIG_SIGNING_KEY_B64" || {
+            echo "缺少 STARFLOW_CONFIG_SIGNING_KEY_B64，拒绝生成未签名配置"
+            exit 1
+          }
+          python tools/starflow/sign_manifest.py \
+            --manifest build/starflow-live/manifest.json \
+            --signature build/starflow-live/manifest.sig \
+            --digest build/starflow-live/manifest.sha256 \
+            --expected-public-key-b64 "$CONFIG_PUBLIC_KEY_B64" \
+            --key-id "$CONFIG_KEY_ID"
+
+      - name: Verify final bundle
+        id: verify
+        if: ${{ steps.generate.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          python tools/starflow/verify_bundle.py \
+            --bundle build/starflow-live \
+            --public-key-b64 "$CONFIG_PUBLIC_KEY_B64"
+
+      - name: Upload sanitized bundle and report
+        if: ${{ steps.sync.outputs.changed == 'true' && always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: starflow-live-${{ github.run_number }}
+          retention-days: 14
+          path: |
+            build/starflow-live
+            build/source-report.json
+          if-no-files-found: error
+
+      - name: Check 1Panel deployment secrets
+        id: deploy_secrets
+        if: ${{ steps.generate.outcome == 'success' && steps.verify.outcome == 'success' && github.ref == 'refs/heads/master' && (github.event_name == 'schedule' || github.event_name == 'push' || inputs.deploy == true) }}
+        env:
+          DEPLOY_HOST: ${{ secrets.STARFLOW_DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.STARFLOW_DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.STARFLOW_DEPLOY_USER }}
+          DEPLOY_KEY: ${{ secrets.STARFLOW_DEPLOY_KEY }}
+          DEPLOY_PATH: ${{ secrets.STARFLOW_DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_HOST" || { echo "缺少 STARFLOW_DEPLOY_HOST"; exit 1; }
+          test -n "$DEPLOY_PORT" || { echo "缺少 STARFLOW_DEPLOY_PORT"; exit 1; }
+          test -n "$DEPLOY_USER" || { echo "缺少 STARFLOW_DEPLOY_USER"; exit 1; }
+          test -n "$DEPLOY_KEY" || { echo "缺少 STARFLOW_DEPLOY_KEY"; exit 1; }
+          test -n "$DEPLOY_PATH" || { echo "缺少 STARFLOW_DEPLOY_PATH"; exit 1; }
+          case "$DEPLOY_PATH" in
+            /*) ;;
+            *) echo "部署目录必须是绝对路径"; exit 1 ;;
+          esac
+          if [[ "$DEPLOY_PATH" =~ [^A-Za-z0-9_./-] ]]; then
+            echo "部署目录包含不支持的字符"
+            exit 1
+          fi
+
+      - name: Atomically publish release to 1Panel
+        if: ${{ steps.deploy_secrets.outcome == 'success' }}
+        env:
+          DEPLOY_HOST: ${{ secrets.STARFLOW_DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.STARFLOW_DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.STARFLOW_DEPLOY_USER }}
+          DEPLOY_KEY: ${{ secrets.STARFLOW_DEPLOY_KEY }}
+          DEPLOY_PATH: ${{ secrets.STARFLOW_DEPLOY_PATH }}
+          CONFIG_VERSION: ${{ steps.version.outputs.config_version }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$RUNNER_TEMP/starflow-ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$RUNNER_TEMP/starflow-ssh/id_ed25519"
+          chmod 600 "$RUNNER_TEMP/starflow-ssh/id_ed25519"
+
+          remote_target="$DEPLOY_USER@$DEPLOY_HOST"
+          remote_command="$(printf 'bash -s -- %q %q %q' "$DEPLOY_PATH" "$CONFIG_VERSION" "$GITHUB_RUN_ID")"
+          tar -C build/starflow-live -czf - . | ssh -p "$DEPLOY_PORT" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=accept-new \
+            -i "$RUNNER_TEMP/starflow-ssh/id_ed25519" \
+            "$remote_target" "$remote_command" <<'REMOTE'
+          set -euo pipefail
+          root="$1"
+          version="$2"
+          run_id="$3"
+          release_root="$root/releases"
+          stage="$release_root/.staging-$version-$run_id"
+          final="$release_root/$version"
+
+          case "$root" in
+            /*) ;;
+            *) echo "远端目录必须是绝对路径"; exit 1 ;;
+          esac
+          case "$version" in
+            ''|*[!0-9]*) echo "远端版本无效"; exit 1 ;;
+          esac
+          mkdir -p "$release_root"
+          if [ -e "$final" ] || [ -e "$stage" ]; then
+            echo "远端版本目录已存在"
+            exit 1
+          fi
+          mkdir "$stage"
+          cleanup_stage() {
+            rm -rf -- "$stage"
+          }
+          trap cleanup_stage EXIT
+          tar -xzf - -C "$stage"
+          test -s "$stage/manifest.json"
+          test -s "$stage/manifest.sig"
+          test -s "$stage/manifest.sha256"
+          test -s "$stage/live.json"
+          test -s "$stage/live.txt"
+          (cd "$stage" && sha256sum -c manifest.sha256 && sha256sum -c checksums.sha256)
+          mv -- "$stage" "$final"
+          trap - EXIT
+
+          install -d -m 0755 "$root"
+          for name in manifest.sig manifest.sha256 live.json live.txt live.m3u tvbox-live.json epg.xml; do
+            if [ -f "$final/$name" ]; then
+              temp="$root/.$name.$version.$run_id.tmp"
+              install -m 0644 "$final/$name" "$temp"
+              mv -f -- "$temp" "$root/$name"
+            fi
+          done
+          temp="$root/.manifest.json.$version.$run_id.tmp"
+          install -m 0644 "$final/manifest.json" "$temp"
+          mv -f -- "$temp" "$root/manifest.json"
+          echo "1Panel release published"
+          REMOTE
+
+      - name: Write pipeline summary
+        if: always()
+        run: |
+          {
+            echo "## StarFlowTV source pipeline"
+            echo ""
+            echo "- Upstream source: tv/iptv4.m3u"
+            echo "- Public query parameters are preserved only when allowed"
+            echo "- Temporary authentication parameters are filtered"
+            echo "- Source probes run against sanitized URLs"
+            echo "- Official source line was not modified"
+          } >> "$GITHUB_STEP_SUMMARY"
