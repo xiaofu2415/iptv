@@ -18,6 +18,7 @@ class SigningConfigurationTest(unittest.TestCase):
         self.assertIn("test -s tv/iptv4.txt", workflow)
         self.assertIn("--input tv/iptv4.m3u", workflow)
         self.assertIn("--input tv/iptv4.txt", workflow)
+        self.assertIn("--input tools/starflow/legacy-iptv4.m3u", workflow)
         self.assertIn("--source-label iptv", workflow)
 
 

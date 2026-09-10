@@ -3,10 +3,12 @@
 These scripts convert the upstream IPv4 catalog into the signed live
 configuration consumed by StarFlowTV.
 
-The workflow reads both `tv/iptv4.m3u` and `tv/iptv4.txt`. The TXT catalog is
-intentional: it contains the complete multi-line candidate set for channels
-such as CCTV1-CCTV17, while the M3U is a smaller metadata-oriented view.
-Identical sanitized URLs are deduplicated only after both inputs are merged.
+The workflow reads the synchronized `tv/iptv4.m3u` and `tv/iptv4.txt` plus the
+protected `tools/starflow/legacy-iptv4.m3u` snapshot. The TXT catalog is
+intentional: it is the current upstream view, while the protected, already
+sanitized snapshot retains the previous Fork candidates for CCTV1-CCTV17 and
+international channels when an upstream refresh temporarily removes them.
+Identical sanitized URLs are deduplicated only after all inputs are merged.
 
 Generated groups carry the visible suffix `｜来源：iptv`, so a TV user can tell
 that the catalog came from the `xiaofu2415/iptv` Fork synchronized from
