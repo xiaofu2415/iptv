@@ -8,13 +8,14 @@ from pathlib import Path
 MODULE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(MODULE_DIR))
 
-from m3u_to_starflow import (  # noqa: E402
-    build_manifest,
-    convert_text,
-    redact_url,
-    sanitize_url,
-    write_bundle,
-)
+import m3u_to_starflow as converter  # noqa: E402
+
+build_manifest = converter.build_manifest
+convert_text = converter.convert_text
+convert_files = converter.convert_files
+redact_url = converter.redact_url
+sanitize_url = converter.sanitize_url
+write_bundle = converter.write_bundle
 
 
 M3U = """#EXTM3U x-tvg-url="https://epg.example/e.xml"
@@ -30,6 +31,23 @@ https://stream.example/hunan.m3u8?id=hunan&signature=temporary
 https://stream.example/zhejiang.m3u8?id=zhejiang&expires=123
 #EXTINF:-1 tvg-id="UNKNOWN" group-title="测试",未知线路
 https://stream.example/unknown.m3u8?quality=hd
+"""
+
+
+TXT = """央视频道,#genre#
+CCTV1,http://one.example/cctv1.m3u8?key=txiptv&playlive=0&authid=0
+CCTV1,http://two.example/cctv1.m3u8?key=txiptv&playlive=1&authid=0
+CCTV17,https://live.example/cctv17?streamid=abc&livekey=xyz
+电影频道,#genre#
+老电影,https://vod.example/20221018/movie/index.m3u8
+春晚频道,#genre#
+2022年春晚,https://vod.example/archive.mp4
+更新时间,#genre#
+2026-09-09,https://vod.example/update.mp4
+卫视频道,#genre#
+录播卫视,https://txmov2.a.kwimgs.com/bs3/video-hls/5219953535631090825_hlsb.m3u8
+海外公开频道,#genre#
+CGTN,https://live.example/cgtn.m3u8
 """
 
 
@@ -52,6 +70,17 @@ class M3UToStarflowTest(unittest.TestCase):
         self.assertFalse(sanitize_url("http://stream.example/live.m3u8?bad=%ZZ").ok)
         self.assertFalse(sanitize_url("not-a-url").ok)
         self.assertFalse(sanitize_url("http://user:password@stream.example/live.m3u8").ok)
+
+    def test_sanitize_preserves_required_stream_parameters(self):
+        result = sanitize_url(
+            "https://live.example/cctv17?streamid=abc&livekey=xyz&token=temporary"
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            "https://live.example/cctv17?streamid=abc&livekey=xyz",
+            result.url,
+        )
+        self.assertEqual(("token",), result.removed_keys)
 
     def test_conversion_keeps_multiple_lines_and_removes_sensitive_values(self):
         result = convert_text(
@@ -83,10 +112,118 @@ class M3UToStarflowTest(unittest.TestCase):
             M3U,
             config_version=123,
             generated_at="2026-09-09T00:00:00Z",
-            probe_fn=lambda url: "backup" not in url and "unknown" not in url,
+            probe_fn=lambda url: (
+                True
+                if "backup" not in url and "unknown" not in url
+                else {"status": "failed", "reason": "http_status_404"}
+            ),
         )
         self.assertFalse(result.passed)
         self.assertIn("multi_line", result.report["qualityGate"]["failed"])
+
+    def test_txt_catalog_keeps_multiple_cctv_lines_and_required_parameters(self):
+        try:
+            result = convert_text(
+                TXT,
+                config_version=123,
+                generated_at="2026-09-09T00:00:00Z",
+                probe_fn=lambda url: True,
+                source_format="txt",
+            )
+        except TypeError as exc:
+            self.fail("converter must support source_format=txt: %s" % exc)
+        cctv1 = next(channel for channel in result.channels if channel["name"] == "CCTV1")
+        self.assertEqual(2, len(cctv1["sources"]))
+        cctv17 = next(channel for channel in result.channels if channel["name"] == "CCTV17")
+        self.assertIn("streamid=abc", cctv17["sources"][0]["url"])
+        self.assertIn("livekey=xyz", cctv17["sources"][0]["url"])
+
+    def test_core_cctv_lines_are_retained_when_probe_has_network_failure(self):
+        result = convert_text(
+            TXT,
+            config_version=123,
+            generated_at="2026-09-09T00:00:00Z",
+            probe_fn=lambda url: {"status": "failed", "reason": "request_failed"},
+            require_quality_gate=False,
+            source_format="txt",
+        )
+        names = {channel["name"] for channel in result.channels}
+        self.assertEqual({"CCTV1", "CCTV17"}, names)
+        retained = [item for item in result.report["accepted"] if item["status"] == "unverified"]
+        self.assertEqual(3, len(retained))
+
+    def test_core_cctv_lines_are_not_retained_when_probe_proves_vod(self):
+        result = convert_text(
+            TXT,
+            config_version=123,
+            generated_at="2026-09-09T00:00:00Z",
+            probe_fn=lambda url: {"status": "failed", "reason": "not_live_playlist"},
+            require_quality_gate=False,
+            source_format="txt",
+        )
+        self.assertEqual([], result.channels)
+
+    def test_txt_catalog_drops_historical_and_vod_groups(self):
+        try:
+            result = convert_text(
+                TXT,
+                config_version=123,
+                generated_at="2026-09-09T00:00:00Z",
+                probe_fn=lambda url: True,
+                source_format="txt",
+            )
+        except TypeError as exc:
+            self.fail("converter must support source_format=txt: %s" % exc)
+        names = {channel["name"] for channel in result.channels}
+        self.assertEqual({"CCTV1", "CCTV17", "CGTN"}, names)
+
+    def test_generated_groups_show_source_label(self):
+        try:
+            result = convert_text(
+                TXT,
+                config_version=123,
+                generated_at="2026-09-09T00:00:00Z",
+                probe_fn=lambda url: True,
+                source_format="txt",
+            )
+        except TypeError as exc:
+            self.fail("converter must support source_format=txt: %s" % exc)
+        self.assertTrue(all("｜来源：iptv" in channel["group"] for channel in result.channels))
+
+    def test_multiple_input_formats_are_merged_without_losing_cctv_lines(self):
+        m3u = """#EXTM3U
+#EXTINF:-1 tvg-id="CCTV1" group-title="央视频道",CCTV1
+https://one.example/cctv1.m3u8?id=one
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source.m3u").write_text(m3u, encoding="utf-8")
+            (root / "source.txt").write_text(
+                "央视频道,#genre#\nCCTV1,https://two.example/cctv1.m3u8?id=two\n",
+                encoding="utf-8",
+            )
+            result = convert_files(
+                [root / "source.m3u", root / "source.txt"],
+                config_version=123,
+                generated_at="2026-09-09T00:00:00Z",
+                probe_fn=lambda url: True,
+            )
+        cctv1 = next(channel for channel in result.channels if channel["name"] == "CCTV1")
+        self.assertEqual(2, len(cctv1["sources"]))
+
+    def test_hls_vod_playlist_is_not_live(self):
+        body = b"#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:6,\na.ts\n#EXT-X-ENDLIST\n"
+        classifier = getattr(converter, "classify_playlist_body", None)
+        self.assertTrue(callable(classifier), "classify_playlist_body must be implemented")
+        if callable(classifier):
+            self.assertEqual((False, "not_live_playlist"), classifier(body))
+
+    def test_hls_live_playlist_without_endlist_is_live(self):
+        body = b"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:42\n#EXTINF:6,\na.ts\n"
+        classifier = getattr(converter, "classify_playlist_body", None)
+        self.assertTrue(callable(classifier), "classify_playlist_body must be implemented")
+        if callable(classifier):
+            self.assertEqual((True, ""), classifier(body))
 
     def test_report_is_redacted(self):
         result = convert_text(

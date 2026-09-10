@@ -107,13 +107,17 @@ jobs:
         run: |
           set -euo pipefail
           test -s tv/iptv4.m3u
+          test -s tv/iptv4.txt
           mkdir -p build/starflow-live
           python tools/starflow/m3u_to_starflow.py \
             --input tv/iptv4.m3u \
+            --input tv/iptv4.txt \
             --output-dir build/starflow-live \
             --config-version "$CONFIG_VERSION" \
             --base-url "$CONFIG_BASE_URL" \
             --key-id "$CONFIG_KEY_ID" \
+            --source-format auto \
+            --source-label iptv \
             --probe-http \
             --timeout 5 \
             --retries 2 \
