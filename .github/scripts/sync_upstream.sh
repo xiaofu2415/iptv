@@ -61,6 +61,9 @@ merge_upstream() {
   git add -A
   if ! git diff --cached --quiet; then
     git commit -m "chore: sync upstream source data"
+  elif git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+    echo "合并后没有可同步的非保护文件，取消合并"
+    git merge --abort
   fi
 }
 
@@ -70,6 +73,7 @@ upstream_source_unchanged() {
   git diff --quiet "HEAD...upstream/$UPSTREAM_BRANCH" -- \
     . \
     ':(exclude).github/workflows' \
+    ':(exclude).github/scripts' \
     ':(exclude)tools/starflow'
 }
 
