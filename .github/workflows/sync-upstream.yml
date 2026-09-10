@@ -108,10 +108,12 @@ jobs:
           set -euo pipefail
           test -s tv/iptv4.m3u
           test -s tv/iptv4.txt
+          test -s tools/starflow/legacy-iptv4.m3u
           mkdir -p build/starflow-live
           python tools/starflow/m3u_to_starflow.py \
             --input tv/iptv4.m3u \
             --input tv/iptv4.txt \
+            --input tools/starflow/legacy-iptv4.m3u \
             --output-dir build/starflow-live \
             --config-version "$CONFIG_VERSION" \
             --base-url "$CONFIG_BASE_URL" \
