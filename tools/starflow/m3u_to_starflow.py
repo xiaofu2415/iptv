@@ -38,12 +38,21 @@ TEMPORARY_QUERY_KEYS = frozenset(
         "nonce",
     )
 )
-PUBLIC_QUERY_KEYS = frozenset(("key", "playlive", "authid", "id"))
+PUBLIC_QUERY_KEYS = frozenset(("key", "playlive", "authid", "id", "streamid", "livekey"))
 PUBLIC_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+PUBLIC_QUERY_VALUE = re.compile(r"^[A-Za-z0-9._~:/+%=-]{1,256}$")
 DIGITS = re.compile(r"^[0-9]+$")
 INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 ATTRIBUTE = re.compile(r'([A-Za-z0-9_-]+)\s*=\s*"([^"]*)"')
 ID_ALLOWED = re.compile(r"[^a-z0-9._-]+")
+CCTV_NAME = re.compile(r"^CCTV[- ]?(\d{1,2})(\+)?$", re.IGNORECASE)
+CORE_CCTV_NAME = re.compile(r"^CCTV[- ]?(?:[1-9]|1[0-7])$", re.IGNORECASE)
+HISTORICAL_PATH = re.compile(r"(?:^|[/_-])(?:19|20)\d{6}(?:[/_-]|$)")
+
+EXCLUDED_GROUP_MARKERS = ("电影", "春晚", "更新时间")
+NON_LIVE_NAME_MARKERS = ("支持作者", "更新时间", "回放", "录像")
+NON_LIVE_SUFFIXES = (".mp4", ".flv", ".mov", ".avi", ".mkv", ".mp3")
+ARCHIVE_PATH_MARKERS = ("/video-hls/", "/upic/", "/playback/", "/vod/")
 
 MEDIA_TYPES = {
     "live.json": "application/json",
@@ -111,6 +120,8 @@ def _public_parameter(key: str, value: str) -> Optional[Tuple[str, str]]:
         return "authid", value
     if normalized == "id" and PUBLIC_ID.fullmatch(value):
         return "id", value
+    if normalized in ("streamid", "livekey") and PUBLIC_QUERY_VALUE.fullmatch(value):
+        return normalized, value
     return None
 
 
@@ -181,6 +192,24 @@ def redact_url(url: str) -> str:
         return "<invalid-url>"
 
 
+def classify_playlist_body(body: bytes) -> Tuple[bool, str]:
+    """Classify an HLS response body as a live playlist or an archive."""
+
+    if not body:
+        return False, "empty_response"
+    text = body.decode("utf-8", errors="replace")
+    upper = text.upper()
+    if "#EXTM3U" not in upper:
+        return True, ""
+    if "#EXT-X-ENDLIST" in upper or "#EXT-X-PLAYLIST-TYPE:VOD" in upper:
+        return False, "not_live_playlist"
+    if "#EXT-X-STREAM-INF" in upper:
+        return True, ""
+    if "#EXTINF" not in upper:
+        return False, "no_media_segments"
+    return True, ""
+
+
 def probe_url(url: str, timeout: float = 5.0, retries: int = 2) -> Dict[str, object]:
     """Perform a bounded request against the sanitized URL."""
 
@@ -214,6 +243,11 @@ def probe_url(url: str, timeout: float = 5.0, retries: int = 2) -> Dict[str, obj
                 if not body:
                     last_reason = "empty_response"
                     continue
+                if looks_like_playlist:
+                    live, reason = classify_playlist_body(body)
+                    if not live:
+                        last_reason = reason
+                        continue
                 return {"status": "passed", "httpStatus": status}
         except HTTPError as exc:
             last_reason = "http_status_%s" % exc.code
@@ -251,6 +285,56 @@ def parse_m3u(text: str) -> Tuple[str, List[M3UEntry]]:
     return header, entries
 
 
+def parse_txt(text: str) -> Tuple[str, List[M3UEntry]]:
+    """Parse the upstream name,url catalog with `,#genre#` sections."""
+
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    entries: List[M3UEntry] = []
+    group = ""
+    for raw_line in lines:
+        line = raw_line.strip().lstrip("\ufeff")
+        if not line:
+            continue
+        if line.startswith("#EXTM3U"):
+            continue
+        if line.endswith(",#genre#"):
+            group = line[: -len(",#genre#")].strip()
+            continue
+        if not group or line.startswith("#"):
+            continue
+        name, separator, url = line.partition(",")
+        name = name.strip()
+        url = url.strip()
+        if not separator or not name or not url:
+            continue
+        entries.append(
+            M3UEntry(
+                {
+                    "group-title": group,
+                    "tvg-id": name,
+                    "tvg-name": name,
+                },
+                name,
+                url,
+            )
+        )
+    return "#EXTM3U", entries
+
+
+def parse_source_text(
+    text: str, source_format: str = "auto"
+) -> Tuple[str, List[M3UEntry]]:
+    """Parse either the upstream M3U or its richer TXT catalog."""
+
+    normalized = source_format.lower().strip()
+    if normalized not in ("auto", "m3u", "txt"):
+        raise ValueError("unsupported_source_format")
+    if normalized == "auto":
+        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        normalized = "m3u" if first_line.startswith(("#EXTM3U", "#EXTINF")) else "txt"
+    return parse_m3u(text) if normalized == "m3u" else parse_txt(text)
+
+
 def _channel_id(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value or "").lower()
     ascii_value = normalized.encode("ascii", "ignore").decode("ascii")
@@ -262,6 +346,64 @@ def _channel_id(value: str) -> str:
 
 def _safe_attribute(value: str) -> str:
     return (value or "").replace('"', "'").replace("\r", " ").replace("\n", " ").strip()
+
+
+def _entry_channel_id(entry: M3UEntry) -> str:
+    label = entry.name or entry.attributes.get("tvg-name", "")
+    match = CCTV_NAME.fullmatch(label.strip())
+    if match:
+        return _channel_id("CCTV" + match.group(1) + ("+" if match.group(2) else ""))
+    channel_value = entry.attributes.get("tvg-id") or entry.attributes.get("tvg-name") or label
+    return _channel_id(channel_value)
+
+
+def _is_core_cctv(entry: M3UEntry) -> bool:
+    label = entry.name or entry.attributes.get("tvg-name", "")
+    return bool(CORE_CCTV_NAME.fullmatch(label.strip()))
+
+
+def _retain_core_after_probe_failure(entry: M3UEntry, reason: str) -> bool:
+    if not _is_core_cctv(entry):
+        return False
+    if reason in (
+        "empty_response",
+        "no_media_segments",
+        "not_live_playlist",
+        "not_m3u_playlist",
+        "non_live_media",
+        "archive_url",
+        "historical_url",
+    ):
+        return False
+    if reason in ("request_failed", "probe_failed", "probe_missing"):
+        return True
+    return reason.startswith(("http_status_403", "http_status_429", "http_status_5"))
+
+
+def _source_drop_reason(entry: M3UEntry) -> str:
+    group = entry.attributes.get("group-title", "").strip()
+    label = entry.name or entry.attributes.get("tvg-name", "")
+    lower_path = urlsplit(entry.url.strip()).path.lower()
+    if any(marker in group for marker in EXCLUDED_GROUP_MARKERS):
+        return "excluded_archive_group"
+    if any(marker in label for marker in NON_LIVE_NAME_MARKERS):
+        return "non_live_label"
+    if lower_path.endswith(NON_LIVE_SUFFIXES):
+        return "non_live_media"
+    if any(marker in lower_path for marker in ARCHIVE_PATH_MARKERS):
+        return "archive_url"
+    if HISTORICAL_PATH.search(lower_path):
+        return "historical_url"
+    return ""
+
+
+def _group_label(group: str, source_label: str) -> str:
+    base = group.strip() or "直播"
+    label = source_label.strip()
+    if not label:
+        return base
+    suffix = "｜来源：" + label
+    return base if base.endswith(suffix) else base + suffix
 
 
 def _probe_state(value: object) -> Tuple[str, str]:
@@ -287,7 +429,11 @@ def quality_gate(
         for channel in channels
     )
     multi_line = any(
-        sum(status == "passed" for status in line_statuses.get(str(channel.get("id")), ())) >= 2
+        sum(
+            status in ("passed", "unverified")
+            for status in line_statuses.get(str(channel.get("id")), ())
+        )
+        >= 2
         for channel in channels
     )
     failed: List[str] = []
@@ -306,20 +452,22 @@ def quality_gate(
     }
 
 
-def convert_text(
-    text: str,
+def _convert_entries(
+    header: str,
+    entries: Sequence[M3UEntry],
     config_version: int,
     generated_at: Optional[str] = None,
     probe_fn: Optional[Callable[[str], object]] = None,
     require_quality_gate: bool = True,
     probe_workers: int = 8,
+    source_label: str = "iptv",
 ) -> ConversionResult:
     if config_version <= 0:
         raise ValueError("config_version_must_be_positive")
-    header, entries = parse_m3u(text)
     generated_at = generated_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     report: Dict[str, object] = {
         "inputEntries": len(entries),
+        "sourceLabel": source_label,
         "accepted": [],
         "dropped": [],
         "qualityGate": {},
@@ -333,6 +481,16 @@ def convert_text(
     seen_urls: Dict[str, str] = {}
     for entry in entries:
         label = entry.name or entry.attributes.get("tvg-name", "")
+        source_drop_reason = _source_drop_reason(entry)
+        if source_drop_reason:
+            dropped_report.append(
+                {
+                    "channel": label,
+                    "reason": source_drop_reason,
+                    "url": redact_url(entry.url),
+                }
+            )
+            continue
         sanitized = sanitize_url(entry.url)
         if not sanitized.ok:
             dropped_report.append(
@@ -350,8 +508,7 @@ def convert_text(
             )
             continue
         seen_urls[sanitized.url] = label
-        channel_value = entry.attributes.get("tvg-id") or entry.attributes.get("tvg-name") or label
-        candidates.append((entry, _channel_id(channel_value), sanitized))
+        candidates.append((entry, _entry_channel_id(entry), sanitized))
 
     probe_results: Dict[str, Tuple[str, str]] = {}
     if probe_fn is not None and candidates:
@@ -376,7 +533,9 @@ def convert_text(
             status, reason = "skipped", "non_http_not_probed"
         else:
             status, reason = probe_results.get(sanitized.url, ("failed", "probe_missing"))
-        if status == "failed":
+        if status == "failed" and _retain_core_after_probe_failure(entry, reason):
+            status = "unverified"
+        elif status == "failed":
             dropped_report.append(
                 {
                     "channel": entry.name,
@@ -389,7 +548,7 @@ def convert_text(
             channel_id,
             {
                 "epgId": entry.attributes.get("tvg-id", ""),
-                "group": entry.attributes.get("group-title", "") or "直播",
+                "group": _group_label(entry.attributes.get("group-title", ""), source_label),
                 "id": channel_id,
                 "logo": entry.attributes.get("tvg-logo", ""),
                 "name": entry.name or entry.attributes.get("tvg-name", "") or channel_id,
@@ -407,14 +566,15 @@ def convert_text(
             }
         )
         line_statuses.setdefault(channel_id, []).append(status)
-        accepted_report.append(
-            {
-                "channel": channel["name"],
-                "status": status,
-                "removedKeys": list(sanitized.removed_keys),
-                "url": redact_url(sanitized.url),
-            }
-        )
+        accepted_item = {
+            "channel": channel["name"],
+            "status": status,
+            "removedKeys": list(sanitized.removed_keys),
+            "url": redact_url(sanitized.url),
+        }
+        if status == "unverified":
+            accepted_item["probeReason"] = reason
+        accepted_report.append(accepted_item)
 
     channels = list(channel_data.values())
     gate = quality_gate(channels, line_statuses)
@@ -462,6 +622,62 @@ def convert_text(
         tvbox_live_json=tvbox_live_json,
         report=report,
         passed=passed,
+    )
+
+
+def convert_text(
+    text: str,
+    config_version: int,
+    generated_at: Optional[str] = None,
+    probe_fn: Optional[Callable[[str], object]] = None,
+    require_quality_gate: bool = True,
+    probe_workers: int = 8,
+    source_format: str = "m3u",
+    source_label: str = "iptv",
+) -> ConversionResult:
+    header, entries = parse_source_text(text, source_format)
+    return _convert_entries(
+        header,
+        entries,
+        config_version=config_version,
+        generated_at=generated_at,
+        probe_fn=probe_fn,
+        require_quality_gate=require_quality_gate,
+        probe_workers=probe_workers,
+        source_label=source_label,
+    )
+
+
+def convert_files(
+    input_paths: Sequence[Path],
+    config_version: int,
+    generated_at: Optional[str] = None,
+    probe_fn: Optional[Callable[[str], object]] = None,
+    require_quality_gate: bool = True,
+    probe_workers: int = 8,
+    source_format: str = "auto",
+    source_label: str = "iptv",
+) -> ConversionResult:
+    if not input_paths:
+        raise ValueError("input_paths_required")
+    header = "#EXTM3U"
+    entries: List[M3UEntry] = []
+    for input_path in input_paths:
+        parsed_header, parsed_entries = parse_source_text(
+            Path(input_path).read_text(encoding="utf-8-sig"), source_format
+        )
+        if header == "#EXTM3U" and parsed_header != "#EXTM3U":
+            header = parsed_header
+        entries.extend(parsed_entries)
+    return _convert_entries(
+        header,
+        entries,
+        config_version=config_version,
+        generated_at=generated_at,
+        probe_fn=probe_fn,
+        require_quality_gate=require_quality_gate,
+        probe_workers=probe_workers,
+        source_label=source_label,
     )
 
 
@@ -541,12 +757,14 @@ def _write_json(path: Path, value: object) -> None:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, dest="input_path")
+    parser.add_argument("--input", required=True, action="append", dest="input_paths")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--config-version", required=True, type=int)
     parser.add_argument("--report", required=True)
     parser.add_argument("--base-url")
     parser.add_argument("--key-id", default="starflow-production-2026-09-r1")
+    parser.add_argument("--source-format", choices=("auto", "m3u", "txt"), default="auto")
+    parser.add_argument("--source-label", default="iptv")
     parser.add_argument("--epg")
     parser.add_argument("--probe-http", action="store_true")
     parser.add_argument("--no-probe", action="store_true")
@@ -557,18 +775,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     if args.probe_http and args.no_probe:
         parser.error("--probe-http and --no-probe are mutually exclusive")
-    input_path = Path(args.input_path)
     output_dir = Path(args.output_dir)
-    text = input_path.read_text(encoding="utf-8-sig")
     probe_fn = None
     if args.probe_http:
         probe_fn = lambda url: probe_url(url, timeout=args.timeout, retries=args.retries)
-    result = convert_text(
-        text,
+    result = convert_files(
+        [Path(path) for path in args.input_paths],
         config_version=args.config_version,
         probe_fn=probe_fn,
         require_quality_gate=not args.allow_unverified,
         probe_workers=args.probe_workers,
+        source_format=args.source_format,
+        source_label=args.source_label,
     )
     write_bundle(result, output_dir, Path(args.epg) if args.epg else None)
     _write_json(Path(args.report), result.report)
