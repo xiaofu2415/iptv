@@ -42,8 +42,8 @@ jobs:
     timeout-minutes: 45
     env:
       CONFIG_BASE_URL: ${{ vars.STARFLOW_CONFIG_BASE_URL || 'https://config.yuying.beauty/starflow/config' }}
-      CONFIG_KEY_ID: ${{ vars.STARFLOW_CONFIG_KEY_ID || 'starflow-production-2026-01' }}
-      CONFIG_PUBLIC_KEY_B64: "UoMhgZDSBxilLMXr0qGSTGH2NhNEzxP05gIpuzTv9xs="
+      CONFIG_KEY_ID: ${{ vars.STARFLOW_CONFIG_KEY_ID || 'starflow-production-2026-09-r1' }}
+      CONFIG_PUBLIC_KEY_B64: "kBZZK4w6OTEWuAQVUrXPK7AVo4kgktUZEV0wBVvrDFM="
 
     steps:
       - name: Checkout repository

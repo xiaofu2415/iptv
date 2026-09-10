@@ -546,7 +546,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--config-version", required=True, type=int)
     parser.add_argument("--report", required=True)
     parser.add_argument("--base-url")
-    parser.add_argument("--key-id", default="starflow-production-2026-01")
+    parser.add_argument("--key-id", default="starflow-production-2026-09-r1")
     parser.add_argument("--epg")
     parser.add_argument("--probe-http", action="store_true")
     parser.add_argument("--no-probe", action="store_true")
