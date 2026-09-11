@@ -49,10 +49,20 @@ CCTV_NAME = re.compile(r"^CCTV[- ]?(\d{1,2})(\+)?$", re.IGNORECASE)
 CORE_CCTV_NAME = re.compile(r"^CCTV[- ]?(?:[1-9]|1[0-7])$", re.IGNORECASE)
 HISTORICAL_PATH = re.compile(r"(?:^|[/_-])(?:19|20)\d{6}(?:[/_-]|$)")
 
-EXCLUDED_GROUP_MARKERS = ("电影", "春晚", "更新时间")
+EXCLUDED_GROUP_MARKERS = (
+    "电影",
+    "春晚",
+    "更新时间",
+    "音乐",
+    "解说",
+    "记录",
+    "纪录",
+)
 NON_LIVE_NAME_MARKERS = ("支持作者", "更新时间", "回放", "录像")
 NON_LIVE_SUFFIXES = (".mp4", ".flv", ".mov", ".avi", ".mkv", ".mp3")
 ARCHIVE_PATH_MARKERS = ("/video-hls/", "/upic/", "/playback/", "/vod/")
+CCTV13_RECORDED_CLIP_HOST = "ali-m-l.cztv.com"
+CCTV13_RECORDED_CLIP_PATH = "/channels/lantian/channel21/1080p.m3u8"
 
 MEDIA_TYPES = {
     "live.json": "application/json",
@@ -362,6 +372,22 @@ def _is_core_cctv(entry: M3UEntry) -> bool:
     return bool(CORE_CCTV_NAME.fullmatch(label.strip()))
 
 
+def _is_cctv13(entry: M3UEntry) -> bool:
+    label = entry.name or entry.attributes.get("tvg-name", "")
+    match = CCTV_NAME.fullmatch(label.strip())
+    return bool(match and match.group(1) == "13" and not match.group(2))
+
+
+def _is_known_cctv13_recorded_clip(entry: M3UEntry) -> bool:
+    if not _is_cctv13(entry):
+        return False
+    parts = urlsplit(entry.url.strip())
+    return (
+        (parts.hostname or "").lower() == CCTV13_RECORDED_CLIP_HOST
+        and parts.path.lower() == CCTV13_RECORDED_CLIP_PATH
+    )
+
+
 def _retain_core_after_probe_failure(entry: M3UEntry, reason: str) -> bool:
     if not _is_core_cctv(entry):
         return False
@@ -384,8 +410,10 @@ def _source_drop_reason(entry: M3UEntry) -> str:
     group = entry.attributes.get("group-title", "").strip()
     label = entry.name or entry.attributes.get("tvg-name", "")
     lower_path = urlsplit(entry.url.strip()).path.lower()
+    if _is_known_cctv13_recorded_clip(entry):
+        return "known_recorded_clip"
     if any(marker in group for marker in EXCLUDED_GROUP_MARKERS):
-        return "excluded_archive_group"
+        return "excluded_live_group"
     if any(marker in label for marker in NON_LIVE_NAME_MARKERS):
         return "non_live_label"
     if lower_path.endswith(NON_LIVE_SUFFIXES):

@@ -15,8 +15,10 @@ that the catalog came from the `xiaofu2415/iptv` Fork synchronized from
 `vbskycn/iptv`.
 
 Archive/VOD groups such as movies, Spring Festival recordings, update videos,
-and obvious downloadable media are excluded before probing. HLS playlists
-marked VOD or ending with `#EXT-X-ENDLIST` are also rejected.
+music, commentary, record/documentary groups, and obvious downloadable media
+are excluded before probing. The known CCTV13 Zhejiang `channel21` replay clip
+is also excluded; other CCTV13 candidates are still evaluated independently.
+HLS playlists marked VOD or ending with `#EXT-X-ENDLIST` are also rejected.
 For CCTV1-CCTV17, a network-only probe failure is recorded as `unverified` and
 kept as a fallback; a probe that proves the stream is VOD still removes it.
 
