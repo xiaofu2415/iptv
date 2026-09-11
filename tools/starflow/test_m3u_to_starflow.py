@@ -51,6 +51,28 @@ CGTN,https://live.example/cgtn.m3u8
 """
 
 
+EXCLUDED_GROUPS_TXT = """央视频道,#genre#
+CCTV13,http://live.example/cctv13.m3u8
+CCTV15,http://live.example/cctv15.m3u8
+音乐频道,#genre#
+音乐欣赏,http://music.example/live.m3u8
+解说频道,#genre#
+笑看风云,http://commentary.example/live.m3u8
+记录频道,#genre#
+记录片频道,http://record.example/live.m3u8
+纪录频道,#genre#
+CGTN纪录,http://documentary.example/live.m3u8
+"""
+
+
+CCTV13_WITH_RECORDED_CLIP = """#EXTM3U
+#EXTINF:-1 tvg-id="CCTV13" tvg-name="CCTV13" group-title="央视频道",CCTV13
+http://ali-m-l.cztv.com/channels/lantian/channel21/1080p.m3u8
+#EXTINF:-1 tvg-id="CCTV13" tvg-name="CCTV13" group-title="央视频道",CCTV13
+http://live.example/cctv13.m3u8
+"""
+
+
 class M3UToStarflowTest(unittest.TestCase):
     def test_sanitize_preserves_public_parameters_and_removes_temporary_values(self):
         result = sanitize_url(
@@ -189,6 +211,35 @@ class M3UToStarflowTest(unittest.TestCase):
         except TypeError as exc:
             self.fail("converter must support source_format=txt: %s" % exc)
         self.assertTrue(all("｜来源：iptv" in channel["group"] for channel in result.channels))
+
+    def test_user_excluded_groups_are_not_published_but_cctv_music_channel_remains(self):
+        result = convert_text(
+            EXCLUDED_GROUPS_TXT,
+            config_version=123,
+            generated_at="2026-09-09T00:00:00Z",
+            probe_fn=lambda url: True,
+            source_format="txt",
+        )
+        self.assertEqual({"CCTV13", "CCTV15"}, {channel["name"] for channel in result.channels})
+        published_groups = {channel["group"] for channel in result.channels}
+        self.assertTrue(all("音乐" not in group for group in published_groups))
+        self.assertTrue(all("解说" not in group for group in published_groups))
+        self.assertTrue(all("记录" not in group and "纪录" not in group for group in published_groups))
+        dropped_reasons = [item["reason"] for item in result.report["dropped"]]
+        self.assertEqual(4, dropped_reasons.count("excluded_live_group"))
+
+    def test_known_cctv13_recorded_clip_is_dropped_but_other_candidate_survives(self):
+        result = convert_text(
+            CCTV13_WITH_RECORDED_CLIP,
+            config_version=123,
+            generated_at="2026-09-09T00:00:00Z",
+            probe_fn=lambda url: True,
+        )
+        cctv13 = next(channel for channel in result.channels if channel["name"] == "CCTV13")
+        self.assertEqual(["http://live.example/cctv13.m3u8"], [source["url"] for source in cctv13["sources"]])
+        dropped = [item for item in result.report["dropped"] if item["channel"] == "CCTV13"]
+        self.assertEqual(1, len(dropped))
+        self.assertEqual("known_recorded_clip", dropped[0]["reason"])
 
     def test_multiple_input_formats_are_merged_without_losing_cctv_lines(self):
         m3u = """#EXTM3U
